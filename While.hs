@@ -46,7 +46,7 @@ type BooleanOperator = String
 --- Analysis ---
 
 data CFG = CFG
-  { _entries :: Map Label Block
+  { _blocks :: Map Label Block
   , _edges :: Map Label [Label]
   }
   deriving (Show)
@@ -54,13 +54,13 @@ data CFG = CFG
 makeGraph :: Label -> [Block] -> [Label] -> CFG
 makeGraph label blocks edges =
   CFG
-    { _entries = Map.fromList $ zip (repeat label) blocks
+    { _blocks = Map.fromList $ zip (repeat label) blocks
     , _edges = Map.singleton label edges
     }
 
 instance Semigroup CFG where
-  (CFG entries1 edges1) <> (CFG entries2 edges2) =
-    CFG (entries1 <> entries2) (Map.unionWith (<>) edges1 edges2)
+  (CFG blocks1 edges1) <> (CFG blocks2 edges2) =
+    CFG (blocks1 <> blocks2) (Map.unionWith (<>) edges1 edges2)
 
 instance Monoid CFG where
   mempty = CFG mempty mempty
@@ -88,9 +88,9 @@ controlFlowGraph = flip evalState 1 . f
         label <- freshLabel
         bodyGraph <- f body
         lastBodyLabel <- gets (subtract 1)
-        let entries = Map.singleton label (Conditional condition)
+        let blocks = Map.singleton label (Conditional condition)
         let edges = Map.fromList [(lastBodyLabel, [label]), (label, [label + 1])]
-        pure $ CFG entries edges <> bodyGraph
+        pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
 freshLabel = state (\n -> (n, n + 1))
