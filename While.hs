@@ -35,11 +35,23 @@ data S
 
 infixr 5 :::
 
-type Identifier = String
+newtype Identifier
+  = Identifier String
+  deriving (Show, Eq, Data, Ord)
+
+-- deriving instance Plated Identifier
+
+newtype A = A String
+  deriving (Show, Eq, Data, Ord)
+
+deriving instance Plated A
+
+instance IsString Identifier where
+  fromString = Identifier
 
 data Assignment
   = Identifier := AExp
-  deriving (Show)
+  deriving (Show, Data)
 
 data AExp
   = Variable Identifier
@@ -50,7 +62,7 @@ data AExp
 deriving instance Plated AExp
 
 instance Show AExp where
-  show (Variable i) = i
+  show (Variable (Identifier i)) = i
   show (Number i) = show i
   show (BinaryArithmetic op a1 a2) = show a1 ++ " " ++ op ++ " " ++ show a2
 
@@ -61,6 +73,8 @@ data BExp
   | BinaryBoolean BooleanOperator BExp BExp
   | BinaryRelational RelationalOperator AExp AExp
   deriving (Show, Data)
+
+deriving instance Plated BExp
 
 type ArithmeticOperator = String
 type RelationalOperator = String
@@ -76,7 +90,9 @@ data CFG = CFG
   { _blocks :: IntMap Block
   , _edges :: IntMap [Label]
   }
-  deriving (Show)
+  deriving (Show, Data)
+
+deriving instance Plated CFG
 
 allEdges :: CFG -> [(Label, Label)]
 allEdges (CFG _ edg) =
@@ -102,7 +118,10 @@ instance Monoid CFG where
 type Label = Int
 
 data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
-  deriving (Show)
+  deriving (Show, Data)
+
+deriving instance Plated Block
+makePrisms ''Block
 
 controlFlowGraph :: Program -> CFG
 controlFlowGraph = flip evalState 0 . f
@@ -133,21 +152,22 @@ freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
 
 -- Find all arithmetic expressions
 allAExp :: Block -> Set AExp
-allAExp (AssignmentBlock (_ := a)) = allAExpA a
-allAExp (Expression a) = allAExpA a
-allAExp (Conditional bexp) = allAExpB bexp
+allAExp = Set.fromList . toListOf (biplate . cosmos . filteredBy _BinaryArithmetic)
 
-allAExpA :: AExp -> Set AExp
-allAExpA = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
+-- allAExp (AssignmentBlock (_ := a)) = allAExpA a
+-- allAExp (Expression a) = allAExpA a
+-- allAExp (Conditional bexp) = allAExpB bexp
+
+-- allAExpA :: AExp -> Set AExp
+-- allAExpA = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
 
 -- allAExpA (Variable _) = Set.empty
 -- allAExpA (Number _) = Set.empty
 -- allAExpA e@(BinaryArithmetic _ a1 a2) =
 --   allAExpA a1 <> allAExpA a2 <> Set.singleton e
 
-allAExpB :: BExp -> Set AExp
-allAExpB = Set.fromList . toListOf biplate
-
+-- allAExpB :: BExp -> Set AExp
+-- allAExpB = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
 -- allAExpB (Not exp) = allAExpB exp
 -- allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
 -- allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
@@ -289,11 +309,23 @@ factorial =
       )
     ::: Assignment ("y" := Number 0)
 
+cfg :: CFG
+cfg = controlFlowGraph factorial
+
+block :: Block
+block = AssignmentBlock ("z" := BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y"))
+
+aexp = BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y")
+
+bexp :: BExp
+bexp = BinaryRelational ">" (Variable "y") (BinaryArithmetic "+" (Number 3) (Number 1))
+
 main :: IO ()
 main = do
-  let cfg = controlFlowGraph factorial
-  -- mapM_ print $ Map.toList . Map.map Set.toList $ worklist rd cfg
-  present $ worklist ae cfg
+  print "hei"
+
+-- mapM_ print $ Map.toList . Map.map Set.toList $ worklist rd cfg
+-- present $ worklist ae cfg
 
 -- spec :: Spec
 -- spec = do
