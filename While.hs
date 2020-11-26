@@ -1,18 +1,25 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 import qualified Debug.Trace as Debug
 
-import qualified Text.Show
-import           Data.Text   ( Text )
+import Control.Lens
+import Data.Data (Data)
+import Data.Data.Lens (biplate)
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
+import Data.Text (Text)
 import Relude
 import Text.Pretty.Simple (pPrint)
+import qualified Text.Show
 
 --- AST ---
 
@@ -38,7 +45,9 @@ data AExp
   = Variable Identifier
   | Number Int
   | BinaryArithmetic ArithmeticOperator AExp AExp
-  deriving (Ord, Eq)
+  deriving (Ord, Eq, Data)
+
+deriving instance Plated AExp
 
 instance Show AExp where
   show (Variable i) = i
@@ -51,11 +60,13 @@ data BExp
   | Not BExp
   | BinaryBoolean BooleanOperator BExp BExp
   | BinaryRelational RelationalOperator AExp AExp
-  deriving (Show)
+  deriving (Show, Data)
 
 type ArithmeticOperator = String
 type RelationalOperator = String
 type BooleanOperator = String
+
+makePrisms ''AExp
 
 --- Analysis ---
 
@@ -116,7 +127,7 @@ controlFlowGraph = flip evalState 0 . f
         pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
-freshLabel = state $ id &&& (+1) -- relude exports (&&&)
+freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
 
 --- Worklist Algorithm ---
 
@@ -127,16 +138,21 @@ allAExp (Expression a) = allAExpA a
 allAExp (Conditional bexp) = allAExpB bexp
 
 allAExpA :: AExp -> Set AExp
-allAExpA (Variable _) = Set.empty
-allAExpA (Number _) = Set.empty
-allAExpA e@(BinaryArithmetic _ a1 a2) =
-  allAExpA a1 <> allAExpA a2 <> Set.singleton e
+allAExpA = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
+
+-- allAExpA (Variable _) = Set.empty
+-- allAExpA (Number _) = Set.empty
+-- allAExpA e@(BinaryArithmetic _ a1 a2) =
+--   allAExpA a1 <> allAExpA a2 <> Set.singleton e
 
 allAExpB :: BExp -> Set AExp
-allAExpB (Not exp) = allAExpB exp
-allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
-allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
-allAExpB _ = Set.empty
+allAExpB = Set.fromList . toListOf biplate
+
+-- allAExpB (Not exp) = allAExpB exp
+-- allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
+-- allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
+-- allAExpB _ = Set.empty
+
 -------------------------------
 
 occursIn :: AExp -> Set Identifier
@@ -173,20 +189,20 @@ defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
 
 data Analysis
- = ReachableDefinition
- | LiveVariable
- | VeryBusy
- | AvailableExpr
- deriving (Show, Eq, Ord, Bounded, Enum)
+  = ReachableDefinition
+  | LiveVariable
+  | VeryBusy
+  | AvailableExpr
+  deriving (Show, Eq, Ord, Bounded, Enum)
 
 data MonotoneFramework a = MF
- { extremal :: CFG -> Set Label
- , init :: CFG -> Set a
- , bottom :: CFG -> Set a
- , transfer :: CFG -> Set a -> Label -> Set a
- , latticeLess :: Set a -> Set a -> Bool
- , latticeJoin :: Set a -> Set a -> Set a
- }
+  { extremal :: CFG -> Set Label
+  , init :: CFG -> Set a
+  , bottom :: CFG -> Set a
+  , transfer :: CFG -> Set a -> Label -> Set a
+  , latticeLess :: Set a -> Set a -> Bool
+  , latticeJoin :: Set a -> Set a -> Set a
+  }
 
 --- Reaching definitions ---
 
@@ -194,20 +210,23 @@ type RDEntry = (Identifier, Maybe Label)
 
 rdTransfer :: CFG -> Set RDEntry -> Label -> Set RDEntry
 rdTransfer cfg old l = gen <> (old Set.\\ kill)
-  where Just block = Map.lookup l $ _blocks cfg
-        gen = Set.map (,Just l) $ defines block
-        kill = Set.filter ((`Set.member` killSet) . fst) old
-          where killSet = defines block
+  where
+    Just block = Map.lookup l $ _blocks cfg
+    gen = Set.map (,Just l) $ defines block
+    kill = Set.filter ((`Set.member` killSet) . fst) old
+      where
+        killSet = defines block
 
 rd :: MonotoneFramework RDEntry
-rd = MF
-  { extremal = const (Set.singleton 0)
-  , init = Set.map (,Nothing) . identifiers
-  , bottom = const Set.empty
-  , latticeLess = Set.isSubsetOf
-  , latticeJoin = Set.union
-  , transfer = rdTransfer
-  }
+rd =
+  MF
+    { extremal = const (Set.singleton 0)
+    , init = Set.map (,Nothing) . identifiers
+    , bottom = const Set.empty
+    , latticeLess = Set.isSubsetOf
+    , latticeJoin = Set.union
+    , transfer = rdTransfer
+    }
 
 --- Available expressions ---
 
@@ -215,21 +234,23 @@ type AEEntry = AExp
 
 aeTransfer :: CFG -> Set AEEntry -> Label -> Set AEEntry
 aeTransfer cfg old l = (old Set.\\ kill) <> gen
-  where Just block = Map.lookup l $ _blocks cfg
-        gen = allAExp block
-        kill = Set.filter (not . (`Set.disjoint` killSet) . occursIn) old
-          where
-            killSet = defines block
+  where
+    Just block = Map.lookup l $ _blocks cfg
+    gen = allAExp block
+    kill = Set.filter (not . (`Set.disjoint` killSet) . occursIn) old
+      where
+        killSet = defines block
 
 ae :: MonotoneFramework AEEntry
-ae = MF
-  { extremal = const (Set.singleton 0)
-  , init = const Set.empty
-  , bottom = foldMap allAExp . _blocks
-  , latticeLess = flip Set.isSubsetOf
-  , latticeJoin = Set.intersection
-  , transfer = aeTransfer
-  }
+ae =
+  MF
+    { extremal = const (Set.singleton 0)
+    , init = const Set.empty
+    , bottom = foldMap allAExp . _blocks
+    , latticeLess = flip Set.isSubsetOf
+    , latticeJoin = Set.intersection
+    , transfer = aeTransfer
+    }
 
 -- worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap (a, a)
 worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
@@ -246,12 +267,13 @@ worklist MF{..} cfg = result $ go (allEdges cfg) initialMap
           output' = Map.insert l' newset output
           edges = filter ((== l') . fst) $ allEdges cfg
        in if latticeLess new ana_post
-             then go rest output
-             else go (edges ++ rest) output'
+            then go rest output
+            else go (edges ++ rest) output'
 
 present :: Show a => IntMap (Set a, Set a) -> IO ()
 present = traverse_ f . Map.toList
-  where f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
+  where
+    f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
 
 --- Main ---
 
