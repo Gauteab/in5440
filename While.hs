@@ -1,14 +1,13 @@
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
-import Debug.Trace
+import qualified Debug.Trace as Debug
 
-import qualified Data.Text as T
+import qualified Text.Show
 import           Data.Text   ( Text )
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
@@ -39,7 +38,12 @@ data AExp
   = Variable Identifier
   | Number Int
   | BinaryArithmetic ArithmeticOperator AExp AExp
-  deriving (Show)
+  deriving (Ord, Eq)
+
+instance Show AExp where
+  show (Variable i) = i
+  show (Number i) = show i
+  show (BinaryArithmetic op a1 a2) = show a1 ++ " " ++ op ++ " " ++ show a2
 
 data BExp
   = True'
@@ -116,6 +120,25 @@ freshLabel = state $ id &&& (+1) -- relude exports (&&&)
 
 --- Worklist Algorithm ---
 
+-- Find all arithmetic expressions
+allAExp :: Block -> Set AExp
+allAExp (AssignmentBlock (_ := a)) = allAExpA a
+allAExp (Expression a) = allAExpA a
+allAExp (Conditional bexp) = allAExpB bexp
+
+allAExpA :: AExp -> Set AExp
+allAExpA (Variable _) = Set.empty
+allAExpA (Number _) = Set.empty
+allAExpA e@(BinaryArithmetic _ a1 a2) =
+  allAExpA a1 <> allAExpA a2 <> Set.singleton e
+
+allAExpB :: BExp -> Set AExp
+allAExpB (Not exp) = allAExpB exp
+allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
+allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
+allAExpB _ = Set.empty
+-------------------------------
+
 occursIn :: AExp -> Set Identifier
 occursIn (Variable ident) = Set.singleton ident
 occursIn (Number _) = Set.empty
@@ -126,6 +149,19 @@ occursInB (Not exp) = occursInB exp
 occursInB (BinaryBoolean _ b1 b2) = on Set.union occursInB b1 b2
 occursInB (BinaryRelational _ a1 a2) = on Set.union occursIn a1 a2
 occursInB _ = Set.empty
+
+identifiers :: CFG -> Set Identifier
+identifiers = foldMap f . _blocks
+  where
+    f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
+    f (Expression a) = fa a
+    f (Conditional bexp) = fb bexp
+    fa (Variable x) = Set.singleton x
+    fa (BinaryArithmetic _ x y) = fa x <> fa y
+    fa _ = Set.empty
+    fb (Not e) = fb e
+    fb (BinaryBoolean _ x y) = fb x <> fb y
+    fb (BinaryRelational _ x y) = fa x <> fa y
 
 uses :: Block -> Set Identifier
 uses (AssignmentBlock (_ := a)) = occursIn a
@@ -144,13 +180,15 @@ data Analysis
  deriving (Show, Eq, Ord, Bounded, Enum)
 
 data MonotoneFramework a = MF
- { extremal :: Set Label
- , init :: Set a
- , bottom :: Set a
- , transfer :: Set a -> Label -> Set a
- , test :: Set a -> Set a -> Bool
- , join :: Set a -> Set a -> Set a
+ { extremal :: CFG -> Set Label
+ , init :: CFG -> Set a
+ , bottom :: CFG -> Set a
+ , transfer :: CFG -> Set a -> Label -> Set a
+ , latticeLess :: Set a -> Set a -> Bool
+ , latticeJoin :: Set a -> Set a -> Set a
  }
+
+--- Reaching definitions ---
 
 type RDEntry = (Identifier, Maybe Label)
 
@@ -161,34 +199,59 @@ rdTransfer cfg old l = gen <> (old Set.\\ kill)
         kill = Set.filter ((`Set.member` killSet) . fst) old
           where killSet = defines block
 
-rd :: CFG -> MonotoneFramework RDEntry
-rd cfg = MF
-  { extremal = Set.singleton 1
-  , init = Set.fromList [("x", Nothing), ("y", Nothing), ("z", Nothing)]
-  , bottom = Set.empty
-  , test = Set.isSubsetOf
-  , join = Set.union
-  , transfer = rdTransfer cfg
+rd :: MonotoneFramework RDEntry
+rd = MF
+  { extremal = const (Set.singleton 0)
+  , init = Set.map (,Nothing) . identifiers
+  , bottom = const Set.empty
+  , latticeLess = Set.isSubsetOf
+  , latticeJoin = Set.union
+  , transfer = rdTransfer
   }
 
--- RD : a = Set (Identifier, Label)
+--- Available expressions ---
 
-worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap a
-worklist MF{..} cfg = go (allEdges cfg) initialMap
+type AEEntry = AExp
+
+aeTransfer :: CFG -> Set AEEntry -> Label -> Set AEEntry
+aeTransfer cfg old l = (old Set.\\ kill) <> gen
+  where Just block = Map.lookup l $ _blocks cfg
+        gen = allAExp block
+        kill = Set.filter (not . (`Set.disjoint` killSet) . occursIn) old
+          where
+            killSet = defines block
+
+ae :: MonotoneFramework AEEntry
+ae = MF
+  { extremal = const (Set.singleton 0)
+  , init = const Set.empty
+  , bottom = foldMap allAExp . _blocks
+  , latticeLess = flip Set.isSubsetOf
+  , latticeJoin = Set.intersection
+  , transfer = aeTransfer
+  }
+
+-- worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap (a, a)
+worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
+worklist MF{..} cfg = result $ go (allEdges cfg) initialMap
   where
-    initialMap = Map.singleton 1 init
+    initialMap = Map.singleton 0 (init cfg)
+    result = Map.mapWithKey (\l pre -> (pre, transfer cfg pre l))
     go [] !output = output
     go ((l, l') : rest) !output =
-      let ana_pre = Map.lookup l output ?: bottom
-          ana_post = Map.lookup l' output ?: bottom
-          new = transfer ana_pre l
-          newset = join new ana_post
-       in if test new ana_post
+      let ana_pre = Map.lookup l output ?: bottom cfg
+          ana_post = Map.lookup l' output ?: bottom cfg
+          new = transfer cfg ana_pre l
+          newset = latticeJoin new ana_post
+          output' = Map.insert l' newset output
+          edges = filter ((== l') . fst) $ allEdges cfg
+       in if latticeLess new ana_post
              then go rest output
-             else let output' = Map.insert l' newset output
-                      edges = filter ((== l') . fst) $ allEdges cfg
-                   in go (edges ++ rest) output'
+             else go (edges ++ rest) output'
 
+present :: Show a => IntMap (Set a, Set a) -> IO ()
+present = traverse_ f . Map.toList
+  where f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
 
 --- Main ---
 
@@ -207,8 +270,8 @@ factorial =
 main :: IO ()
 main = do
   let cfg = controlFlowGraph factorial
-      reaching = rd cfg
-  mapM_ print $ Map.toList . Map.map Set.toList $ worklist reaching cfg
+  -- mapM_ print $ Map.toList . Map.map Set.toList $ worklist rd cfg
+  present $ worklist ae cfg
 
 -- spec :: Spec
 -- spec = do
