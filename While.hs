@@ -127,6 +127,19 @@ occursInB (BinaryBoolean _ b1 b2) = on Set.union occursInB b1 b2
 occursInB (BinaryRelational _ a1 a2) = on Set.union occursIn a1 a2
 occursInB _ = Set.empty
 
+identifiers :: CFG -> Set Identifier
+identifiers = foldMap f . _blocks
+  where
+    f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
+    f (Expression a) = fa a
+    f (Conditional bexp) = fb bexp
+    fa (Variable x) = Set.singleton x
+    fa (BinaryArithmetic _ x y) = fa x <> fa y
+    fa _ = Set.empty
+    fb (Not e) = fb e
+    fb (BinaryBoolean _ x y) = fb x <> fb y
+    fb (BinaryRelational _ x y) = fa x <> fa y
+
 uses :: Block -> Set Identifier
 uses (AssignmentBlock (_ := a)) = occursIn a
 uses (Expression a) = occursIn a
@@ -144,10 +157,10 @@ data Analysis
  deriving (Show, Eq, Ord, Bounded, Enum)
 
 data MonotoneFramework a = MF
- { extremal :: Set Label
- , init :: Set a
+ { extremal :: CFG -> Set Label
+ , init :: CFG -> Set a
  , bottom :: Set a
- , transfer :: Set a -> Label -> Set a
+ , transfer :: CFG -> Set a -> Label -> Set a
  , test :: Set a -> Set a -> Bool
  , join :: Set a -> Set a -> Set a
  }
@@ -161,14 +174,14 @@ rdTransfer cfg old l = gen <> (old Set.\\ kill)
         kill = Set.filter ((`Set.member` killSet) . fst) old
           where killSet = defines block
 
-rd :: CFG -> MonotoneFramework RDEntry
-rd cfg = MF
-  { extremal = Set.singleton 1
-  , init = Set.fromList [("x", Nothing), ("y", Nothing), ("z", Nothing)]
+rd :: MonotoneFramework RDEntry
+rd = MF
+  { extremal = const (Set.singleton 0)
+  , init = Set.map (,Nothing) . identifiers
   , bottom = Set.empty
   , test = Set.isSubsetOf
   , join = Set.union
-  , transfer = rdTransfer cfg
+  , transfer = rdTransfer
   }
 
 -- RD : a = Set (Identifier, Label)
@@ -176,12 +189,12 @@ rd cfg = MF
 worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap a
 worklist MF{..} cfg = go (allEdges cfg) initialMap
   where
-    initialMap = Map.singleton 1 init
+    initialMap = Map.singleton 0 (init cfg)
     go [] !output = output
     go ((l, l') : rest) !output =
       let ana_pre = Map.lookup l output ?: bottom
           ana_post = Map.lookup l' output ?: bottom
-          new = transfer ana_pre l
+          new = transfer cfg ana_pre l
           newset = join new ana_post
        in if test new ana_post
              then go rest output
@@ -207,7 +220,7 @@ factorial =
 main :: IO ()
 main = do
   let cfg = controlFlowGraph factorial
-      reaching = rd cfg
+      reaching = rd
   mapM_ print $ Map.toList . Map.map Set.toList $ worklist reaching cfg
 
 -- spec :: Spec
