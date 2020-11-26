@@ -1,7 +1,17 @@
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
-import qualified Data.Map.Strict as Map
+import Debug.Trace
+
+import qualified Data.Text as T
+import           Data.Text   ( Text )
+import qualified Data.IntMap.Strict as Map
+import qualified Data.Set as Set
 import Relude
 import Text.Pretty.Simple (pPrint)
 
@@ -45,11 +55,20 @@ type BooleanOperator = String
 
 --- Analysis ---
 
+type LabelMap a = IntMap (Set a)
+
 data CFG = CFG
-  { _blocks :: Map Label Block
-  , _edges :: Map Label [Label]
+  { _blocks :: IntMap Block
+  , _edges :: IntMap [Label]
   }
   deriving (Show)
+
+allEdges :: CFG -> [(Label, Label)]
+allEdges (CFG _ edg) =
+  [ (from, to)
+  | (from, vs) <- Map.toList edg
+  , to <- vs
+  ]
 
 makeGraph :: Label -> [Block] -> [Label] -> CFG
 makeGraph label blocks edges =
@@ -71,7 +90,7 @@ data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
   deriving (Show)
 
 controlFlowGraph :: Program -> CFG
-controlFlowGraph = flip evalState 1 . f
+controlFlowGraph = flip evalState 0 . f
   where
     f :: S -> State Label CFG
     f = \case
@@ -93,7 +112,83 @@ controlFlowGraph = flip evalState 1 . f
         pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
-freshLabel = state (\n -> (n, n + 1))
+freshLabel = state $ id &&& (+1) -- relude exports (&&&)
+
+--- Worklist Algorithm ---
+
+occursIn :: AExp -> Set Identifier
+occursIn (Variable ident) = Set.singleton ident
+occursIn (Number _) = Set.empty
+occursIn (BinaryArithmetic _ a1 a2) = on Set.union occursIn a1 a2
+
+occursInB :: BExp -> Set Identifier
+occursInB (Not exp) = occursInB exp
+occursInB (BinaryBoolean _ b1 b2) = on Set.union occursInB b1 b2
+occursInB (BinaryRelational _ a1 a2) = on Set.union occursIn a1 a2
+occursInB _ = Set.empty
+
+uses :: Block -> Set Identifier
+uses (AssignmentBlock (_ := a)) = occursIn a
+uses (Expression a) = occursIn a
+uses (Conditional bexp) = occursInB bexp
+
+defines :: Block -> Set Identifier
+defines (AssignmentBlock (x := _)) = Set.singleton x
+defines _ = Set.empty
+
+data Analysis
+ = ReachableDefinition
+ | LiveVariable
+ | VeryBusy
+ | AvailableExpr
+ deriving (Show, Eq, Ord, Bounded, Enum)
+
+data MonotoneFramework a = MF
+ { extremal :: Set Label
+ , init :: Set a
+ , bottom :: Set a
+ , transfer :: Set a -> Label -> Set a
+ , test :: Set a -> Set a -> Bool
+ , join :: Set a -> Set a -> Set a
+ }
+
+type RDEntry = (Identifier, Maybe Label)
+
+rdTransfer :: CFG -> Set RDEntry -> Label -> Set RDEntry
+rdTransfer cfg old l = gen <> (old Set.\\ kill)
+  where Just block = Map.lookup l $ _blocks cfg
+        gen = Set.map (,Just l) $ defines block
+        kill = Set.filter ((`Set.member` killSet) . fst) old
+          where killSet = defines block
+
+rd :: CFG -> MonotoneFramework RDEntry
+rd cfg = MF
+  { extremal = Set.singleton 1
+  , init = Set.fromList [("x", Nothing), ("y", Nothing), ("z", Nothing)]
+  , bottom = Set.empty
+  , test = Set.isSubsetOf
+  , join = Set.union
+  , transfer = rdTransfer cfg
+  }
+
+-- RD : a = Set (Identifier, Label)
+
+worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap a
+worklist MF{..} cfg = go (allEdges cfg) initialMap
+  where
+    initialMap = Map.singleton 1 init
+    go [] !output = output
+    go ((l, l') : rest) !output =
+      let ana_pre = Map.lookup l output ?: bottom
+          ana_post = Map.lookup l' output ?: bottom
+          new = transfer ana_pre l
+          newset = join new ana_post
+       in if test new ana_post
+             then go rest output
+             else let output' = Map.insert l' newset output
+                      edges = filter ((== l') . fst) $ allEdges cfg
+                   in go (edges ++ rest) output'
+
 
 --- Main ---
 
@@ -110,7 +205,10 @@ factorial =
     ::: Assignment ("y" := Number 0)
 
 main :: IO ()
-main = pPrint $ controlFlowGraph factorial
+main = do
+  let cfg = controlFlowGraph factorial
+      reaching = rd cfg
+  mapM_ print $ Map.toList . Map.map Set.toList $ worklist reaching cfg
 
 -- spec :: Spec
 -- spec = do
