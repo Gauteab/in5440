@@ -1,23 +1,25 @@
-{-# LANGUAGE UnicodeSyntax #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 
 import Control.Lens
 import Data.Data (Data)
 import Data.Data.Lens (biplate)
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
+
 -- import Data.Text (Text)
 import Relude
+
 -- import Text.Pretty.Simple (pPrint)
 import qualified Text.Show
 
@@ -38,14 +40,7 @@ infixr 5 :::
 newtype Identifier
   = Identifier String
   deriving (Eq, Data, Ord)
-  deriving Show via String
-
--- deriving instance Plated Identifier
-
-newtype A = A String
-  deriving (Show, Eq, Data, Ord)
-
-deriving instance Plated A
+  deriving (Show) via String
 
 instance IsString Identifier where
   fromString = Identifier
@@ -95,7 +90,9 @@ data CFG = CFG
 
 deriving instance Plated CFG
 
-allEdges :: CFG -> [(Label, Label)]
+type Flow = [(Label, Label)]
+
+allEdges :: CFG -> Flow
 allEdges (CFG _ edg) =
   [ (from, to)
   | (from, vs) <- Map.toList edg
@@ -169,12 +166,13 @@ defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
 
 data MonotoneFramework a = MF
-  { extremal :: CFG -> Set Label
+  { extremal :: Flow -> Set Label
   , ι :: CFG -> Set a
   , (⊥) :: CFG -> Set a
   , transfer :: CFG -> Set a -> Label -> Set a
   , (⊑) :: Set a -> Set a -> Bool
   , (⨆) :: Set a -> Set a -> Set a
+  , flow :: CFG -> Flow
   }
 
 --- Reaching definitions ---
@@ -199,6 +197,7 @@ rd =
     , (⊑) = Set.isSubsetOf
     , (⨆) = Set.union
     , transfer = rdTransfer
+    , flow = allEdges
     }
 
 --- Available expressions ---
@@ -238,23 +237,49 @@ ae =
     , (⊑) = flip Set.isSubsetOf
     , (⨆) = Set.intersection
     , transfer = aeTransfer
+    , flow = allEdges
+    }
+
+-- Very busy expressions
+
+type VBEntry = AExp
+
+vbTransfer :: CFG -> Set VBEntry -> Label -> Set VBEntry
+vbTransfer = aeTransfer
+
+findExtremal :: Flow -> Set Label
+findExtremal edges = Set.fromList . filter (noInEdges edges) . map fst $ edges
+  where
+    noInEdges :: Flow -> Label -> Bool
+    noInEdges edges l = all ((/= l) . snd) edges
+
+vb :: MonotoneFramework AEEntry
+vb =
+  MF
+    { extremal = findExtremal
+    , ι = const Set.empty
+    , (⊥) = foldMap allAExp . _blocks
+    , (⊑) = flip Set.isSubsetOf
+    , (⨆) = Set.intersection
+    , transfer = vbTransfer
+    , flow = fmap swap . allEdges
     }
 
 -- worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap (a, a)
 worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
-worklist MF{..} cfg = result $ go (allEdges cfg) initialMap
+worklist MF{..} cfg = result $ go (flow cfg) initialMap
   where
-    initialMap = Map.singleton 0 (ι cfg)
+    initialMap = Map.fromList $ zip (Set.toList . extremal $ flow cfg) (repeat . ι $ cfg)
     result = Map.mapWithKey (\l pre -> (pre, transfer cfg pre l))
     go [] !output = output
     go ((l, l') : rest) !output =
-      let ana_pre = Map.lookup l output ?: (⊥) cfg
-          ana_post = Map.lookup l' output ?: (⊥) cfg
-          new = transfer cfg ana_pre l
-          newset = new ⨆ ana_post
+      let analysisPre = Map.lookup l output ?: (⊥) cfg
+          analysisPost = Map.lookup l' output ?: (⊥) cfg
+          new = transfer cfg analysisPre l
+          newset = new ⨆ analysisPost
           output' = Map.insert l' newset output
-          edges = filter ((== l') . fst) $ allEdges cfg
-       in if new ⊑ ana_post
+          edges = filter ((== l') . fst) $ flow cfg
+       in if new ⊑ analysisPost
             then go rest output
             else go (edges ++ rest) output'
 
@@ -265,7 +290,7 @@ present = traverse_ f . Map.toList
 
 --- Main ---
 
--- [y:=x]1; [z:=1]2; while [y>1]3 do ([z:=z*y]4; [y:=y-1]5); [y:=0]6
+--[y:=x]0; [z:=1]1; while [y>1]2 do ([z:=z*y]3; [y:=y-1]4); [y:=0]5
 factorial :: Program
 factorial =
   Assignment ("y" := Variable "x")
@@ -291,9 +316,10 @@ bexp = BinaryRelational ">" (Variable "y") (BinaryArithmetic "+" (Number 3) (Num
 
 main :: IO ()
 main = do
-  -- print "hei"
+  let cfg = controlFlowGraph factorial
   -- present $ worklist ae cfg
-  present $ worklist rd cfg
+  -- present $ worklist rd cfg
+  present $ worklist vb cfg
 
 -- spec :: Spec
 -- spec = do
