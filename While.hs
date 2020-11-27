@@ -150,70 +150,22 @@ freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
 
 --- Worklist Algorithm ---
 
--- Find all arithmetic expressions
 allAExp :: Block -> Set AExp
 allAExp = Set.fromList . toListOf (biplate . cosmos . filteredBy _BinaryArithmetic)
 
--- allAExp (AssignmentBlock (_ := a)) = allAExpA a
--- allAExp (Expression a) = allAExpA a
--- allAExp (Conditional bexp) = allAExpB bexp
+identifiers :: Data a => a -> Set Identifier
+identifiers = toSetOf biplate
 
--- allAExpA :: AExp -> Set AExp
--- allAExpA = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
-
--- allAExpA (Variable _) = Set.empty
--- allAExpA (Number _) = Set.empty
--- allAExpA e@(BinaryArithmetic _ a1 a2) =
---   allAExpA a1 <> allAExpA a2 <> Set.singleton e
-
--- allAExpB :: BExp -> Set AExp
--- allAExpB = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
--- allAExpB (Not exp) = allAExpB exp
--- allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
--- allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
--- allAExpB _ = Set.empty
-
--------------------------------
-
-occursIn :: AExp -> Set Identifier
-occursIn (Variable ident) = Set.singleton ident
-occursIn (Number _) = Set.empty
-occursIn (BinaryArithmetic _ a1 a2) = on Set.union occursIn a1 a2
-
-occursInB :: BExp -> Set Identifier
-occursInB (Not exp) = occursInB exp
-occursInB (BinaryBoolean _ b1 b2) = on Set.union occursInB b1 b2
-occursInB (BinaryRelational _ a1 a2) = on Set.union occursIn a1 a2
-occursInB _ = Set.empty
-
-identifiers :: CFG -> Set Identifier
-identifiers = foldMap f . _blocks
-  where
-    f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
-    f (Expression a) = fa a
-    f (Conditional bexp) = fb bexp
-    fa (Variable x) = Set.singleton x
-    fa (BinaryArithmetic _ x y) = fa x <> fa y
-    fa _ = Set.empty
-    fb (Not e) = fb e
-    fb (BinaryBoolean _ x y) = fb x <> fb y
-    fb (BinaryRelational _ x y) = fa x <> fa y
+toSetOf :: Ord a => Getting (Endo [a]) s a -> s -> Set a
+toSetOf l = Set.fromList . toListOf l
 
 uses :: Block -> Set Identifier
-uses (AssignmentBlock (_ := a)) = occursIn a
-uses (Expression a) = occursIn a
-uses (Conditional bexp) = occursInB bexp
+uses (AssignmentBlock (_ := a)) = identifiers a
+uses a = identifiers a
 
 defines :: Block -> Set Identifier
 defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
-
-data Analysis
-  = ReachableDefinition
-  | LiveVariable
-  | VeryBusy
-  | AvailableExpr
-  deriving (Show, Eq, Ord, Bounded, Enum)
 
 data MonotoneFramework a = MF
   { extremal :: CFG -> Set Label
@@ -257,7 +209,7 @@ aeTransfer cfg old l = (old Set.\\ kill) <> gen
   where
     Just block = Map.lookup l $ _blocks cfg
     gen = allAExp block
-    kill = Set.filter (not . (`Set.disjoint` killSet) . occursIn) old
+    kill = Set.filter (not . (`Set.disjoint` killSet) . Set.fromList . toListOf biplate) old
       where
         killSet = defines block
 
@@ -322,10 +274,8 @@ bexp = BinaryRelational ">" (Variable "y") (BinaryArithmetic "+" (Number 3) (Num
 
 main :: IO ()
 main = do
-  print "hei"
-
--- mapM_ print $ Map.toList . Map.map Set.toList $ worklist rd cfg
--- present $ worklist ae cfg
+  -- print "hei"
+  present $ worklist ae cfg
 
 -- spec :: Spec
 -- spec = do
