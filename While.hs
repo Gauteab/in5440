@@ -1,24 +1,24 @@
+{-# LANGUAGE UnicodeSyntax #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE NoImplicitPrelude #-}
-
-import qualified Debug.Trace as Debug
 
 import Control.Lens
 import Data.Data (Data)
 import Data.Data.Lens (biplate)
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
-import Data.Text (Text)
+-- import Data.Text (Text)
 import Relude
-import Text.Pretty.Simple (pPrint)
+-- import Text.Pretty.Simple (pPrint)
 import qualified Text.Show
 
 --- AST ---
@@ -35,11 +35,24 @@ data S
 
 infixr 5 :::
 
-type Identifier = String
+newtype Identifier
+  = Identifier String
+  deriving (Eq, Data, Ord)
+  deriving Show via String
+
+-- deriving instance Plated Identifier
+
+newtype A = A String
+  deriving (Show, Eq, Data, Ord)
+
+deriving instance Plated A
+
+instance IsString Identifier where
+  fromString = Identifier
 
 data Assignment
   = Identifier := AExp
-  deriving (Show)
+  deriving (Show, Data)
 
 data AExp
   = Variable Identifier
@@ -50,7 +63,7 @@ data AExp
 deriving instance Plated AExp
 
 instance Show AExp where
-  show (Variable i) = i
+  show (Variable (Identifier i)) = i
   show (Number i) = show i
   show (BinaryArithmetic op a1 a2) = show a1 ++ " " ++ op ++ " " ++ show a2
 
@@ -61,6 +74,8 @@ data BExp
   | BinaryBoolean BooleanOperator BExp BExp
   | BinaryRelational RelationalOperator AExp AExp
   deriving (Show, Data)
+
+deriving instance Plated BExp
 
 type ArithmeticOperator = String
 type RelationalOperator = String
@@ -76,7 +91,9 @@ data CFG = CFG
   { _blocks :: IntMap Block
   , _edges :: IntMap [Label]
   }
-  deriving (Show)
+  deriving (Show, Data)
+
+deriving instance Plated CFG
 
 allEdges :: CFG -> [(Label, Label)]
 allEdges (CFG _ edg) =
@@ -102,7 +119,10 @@ instance Monoid CFG where
 type Label = Int
 
 data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
-  deriving (Show)
+  deriving (Show, Data)
+
+deriving instance Plated Block
+makePrisms ''Block
 
 controlFlowGraph :: Program -> CFG
 controlFlowGraph = flip evalState 0 . f
@@ -115,15 +135,15 @@ controlFlowGraph = flip evalState 0 . f
         label2 <- get
         g2 <- f s2
         pure $ g1 <> g2 <> makeGraph label1 [] [label2]
-      (Assignment a) -> do
+      Assignment a -> do
         label <- freshLabel
         pure $ makeGraph label [AssignmentBlock a] []
-      (While condition body) -> do
+      While condition body -> do
         label <- freshLabel
         bodyGraph <- f body
         lastBodyLabel <- gets (subtract 1)
         let blocks = Map.singleton label (Conditional condition)
-        let edges = Map.fromList [(lastBodyLabel, [label]), (label, [label + 1])]
+            edges = Map.fromList [(lastBodyLabel, [label]), (label, [label + 1])]
         pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
@@ -131,77 +151,30 @@ freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
 
 --- Worklist Algorithm ---
 
--- Find all arithmetic expressions
 allAExp :: Block -> Set AExp
-allAExp (AssignmentBlock (_ := a)) = allAExpA a
-allAExp (Expression a) = allAExpA a
-allAExp (Conditional bexp) = allAExpB bexp
+allAExp = Set.fromList . toListOf (biplate . cosmos . filteredBy _BinaryArithmetic)
 
-allAExpA :: AExp -> Set AExp
-allAExpA = Set.fromList . toListOf (cosmos . filteredBy _BinaryArithmetic)
+identifiers :: Data a => a -> Set Identifier
+identifiers = toSetOf biplate
 
--- allAExpA (Variable _) = Set.empty
--- allAExpA (Number _) = Set.empty
--- allAExpA e@(BinaryArithmetic _ a1 a2) =
---   allAExpA a1 <> allAExpA a2 <> Set.singleton e
-
-allAExpB :: BExp -> Set AExp
-allAExpB = Set.fromList . toListOf biplate
-
--- allAExpB (Not exp) = allAExpB exp
--- allAExpB (BinaryBoolean _ b1 b2) = on Set.union allAExpB b1 b2
--- allAExpB (BinaryRelational _ a1 a2) = on Set.union allAExpA a1 a2
--- allAExpB _ = Set.empty
-
--------------------------------
-
-occursIn :: AExp -> Set Identifier
-occursIn (Variable ident) = Set.singleton ident
-occursIn (Number _) = Set.empty
-occursIn (BinaryArithmetic _ a1 a2) = on Set.union occursIn a1 a2
-
-occursInB :: BExp -> Set Identifier
-occursInB (Not exp) = occursInB exp
-occursInB (BinaryBoolean _ b1 b2) = on Set.union occursInB b1 b2
-occursInB (BinaryRelational _ a1 a2) = on Set.union occursIn a1 a2
-occursInB _ = Set.empty
-
-identifiers :: CFG -> Set Identifier
-identifiers = foldMap f . _blocks
-  where
-    f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
-    f (Expression a) = fa a
-    f (Conditional bexp) = fb bexp
-    fa (Variable x) = Set.singleton x
-    fa (BinaryArithmetic _ x y) = fa x <> fa y
-    fa _ = Set.empty
-    fb (Not e) = fb e
-    fb (BinaryBoolean _ x y) = fb x <> fb y
-    fb (BinaryRelational _ x y) = fa x <> fa y
+toSetOf :: Ord a => Getting (Endo [a]) s a -> s -> Set a
+toSetOf l = Set.fromList . toListOf l
 
 uses :: Block -> Set Identifier
-uses (AssignmentBlock (_ := a)) = occursIn a
-uses (Expression a) = occursIn a
-uses (Conditional bexp) = occursInB bexp
+uses (AssignmentBlock (_ := a)) = identifiers a
+uses a = identifiers a
 
 defines :: Block -> Set Identifier
 defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
 
-data Analysis
-  = ReachableDefinition
-  | LiveVariable
-  | VeryBusy
-  | AvailableExpr
-  deriving (Show, Eq, Ord, Bounded, Enum)
-
 data MonotoneFramework a = MF
   { extremal :: CFG -> Set Label
-  , init :: CFG -> Set a
-  , bottom :: CFG -> Set a
+  , ι :: CFG -> Set a
+  , (⊥) :: CFG -> Set a
   , transfer :: CFG -> Set a -> Label -> Set a
-  , latticeLess :: Set a -> Set a -> Bool
-  , latticeJoin :: Set a -> Set a -> Set a
+  , (⊑) :: Set a -> Set a -> Bool
+  , (⨆) :: Set a -> Set a -> Set a
   }
 
 --- Reaching definitions ---
@@ -221,10 +194,10 @@ rd :: MonotoneFramework RDEntry
 rd =
   MF
     { extremal = const (Set.singleton 0)
-    , init = Set.map (,Nothing) . identifiers
-    , bottom = const Set.empty
-    , latticeLess = Set.isSubsetOf
-    , latticeJoin = Set.union
+    , ι = Set.map (,Nothing) . identifiers
+    , (⊥) = const Set.empty
+    , (⊑) = Set.isSubsetOf
+    , (⨆) = Set.union
     , transfer = rdTransfer
     }
 
@@ -237,18 +210,33 @@ aeTransfer cfg old l = (old Set.\\ kill) <> gen
   where
     Just block = Map.lookup l $ _blocks cfg
     gen = allAExp block
-    kill = Set.filter (not . (`Set.disjoint` killSet) . occursIn) old
+    kill = Set.filter (not . (`Set.disjoint` killSet) . toSetOf biplate) old
       where
         killSet = defines block
+
+-- ⊥
+-- UP TACK
+-- Unicode: U+22A5, UTF-8: E2 8A A5
+
+-- ⊑
+-- N-ARY SQUARE UNION OPERATOR
+-- Unicode: U+2A06, UTF-8: E2 A8 86
+
+-- SQUARE IMAGE OF OR EQUAL TO
+-- Unicode: U+2291, UTF-8: E2 8A 91
+
+-- ι
+-- GREEK SMALL LETTER IOTA
+-- Unicode: U+03B9, UTF-8: CE B9
 
 ae :: MonotoneFramework AEEntry
 ae =
   MF
     { extremal = const (Set.singleton 0)
-    , init = const Set.empty
-    , bottom = foldMap allAExp . _blocks
-    , latticeLess = flip Set.isSubsetOf
-    , latticeJoin = Set.intersection
+    , ι = const Set.empty
+    , (⊥) = foldMap allAExp . _blocks
+    , (⊑) = flip Set.isSubsetOf
+    , (⨆) = Set.intersection
     , transfer = aeTransfer
     }
 
@@ -256,17 +244,17 @@ ae =
 worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
 worklist MF{..} cfg = result $ go (allEdges cfg) initialMap
   where
-    initialMap = Map.singleton 0 (init cfg)
+    initialMap = Map.singleton 0 (ι cfg)
     result = Map.mapWithKey (\l pre -> (pre, transfer cfg pre l))
     go [] !output = output
     go ((l, l') : rest) !output =
-      let ana_pre = Map.lookup l output ?: bottom cfg
-          ana_post = Map.lookup l' output ?: bottom cfg
+      let ana_pre = Map.lookup l output ?: (⊥) cfg
+          ana_post = Map.lookup l' output ?: (⊥) cfg
           new = transfer cfg ana_pre l
-          newset = latticeJoin new ana_post
+          newset = new ⨆ ana_post
           output' = Map.insert l' newset output
           edges = filter ((== l') . fst) $ allEdges cfg
-       in if latticeLess new ana_post
+       in if new ⊑ ana_post
             then go rest output
             else go (edges ++ rest) output'
 
@@ -289,11 +277,23 @@ factorial =
       )
     ::: Assignment ("y" := Number 0)
 
+cfg :: CFG
+cfg = controlFlowGraph factorial
+
+block :: Block
+block = AssignmentBlock ("z" := BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y"))
+
+aexp :: AExp
+aexp = BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y")
+
+bexp :: BExp
+bexp = BinaryRelational ">" (Variable "y") (BinaryArithmetic "+" (Number 3) (Number 1))
+
 main :: IO ()
 main = do
-  let cfg = controlFlowGraph factorial
-  -- mapM_ print $ Map.toList . Map.map Set.toList $ worklist rd cfg
-  present $ worklist ae cfg
+  -- print "hei"
+  -- present $ worklist ae cfg
+  present $ worklist rd cfg
 
 -- spec :: Spec
 -- spec = do
