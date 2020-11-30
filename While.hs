@@ -1,3 +1,5 @@
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DerivingVia #-}
@@ -11,10 +13,11 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
+import GHC.Exts
 import Control.Lens
 import Data.Data (Data)
 import Data.Data.Lens (biplate)
-import Data.Foldable
+import Data.Foldable ( Foldable(foldr1), all, traverse_ )
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
 import Relude
@@ -291,12 +294,10 @@ infix 3 =.
 (=.) :: ToAExp a => Identifier -> a -> S
 i =. x = AssignmentStatement $ i := toAExp x
 
-while :: ToStatement t => BExp -> t -> S
-while c = While c . toStatement
 
 class ToAExp a where toAExp :: a -> AExp
-instance ToAExp AExp where toAExp = id
 instance ToAExp Identifier where toAExp = Variable
+instance ToAExp AExp where toAExp = id
 
 class ToStatement t where toStatement :: t -> S
 instance ToStatement S where toStatement = id
@@ -311,15 +312,20 @@ x = "x"
 y = "y"
 z = "z"
 
+instance IsList S where
+  type Item S = S
+  fromList [] = Skip
+  fromList xs = foldr1 (:::) xs
+  toList = undefined
+
 --- Main ---
 
 -- [y:=x]0; [z:=1]1; while [y>1]2 do ([z:=z*y]3; [y:=y-1]4); [y:=0]5
 factorial :: Program
 factorial =
-  toStatement
     [ y =. x
     , z =. Number 1
-    , while
+    , While
         (y >. Number 1)
         [ z =. z *. y
         , y =. y -. Number 1
@@ -336,7 +342,7 @@ main = do
   present $ mfp rd factorialCFG
   putStrLn "\n--- Available Expressions ---\n"
   present $ mfp ae factorialCFG
-  putStrLn "\n--- Very Bussy Expressions ---\n"
+  putStrLn "\n--- Very Busy Expressions ---\n"
   present $ mfp vb factorialCFG
 
 -- ⊥
