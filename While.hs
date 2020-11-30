@@ -8,6 +8,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 import Control.Lens
@@ -35,7 +36,8 @@ infixr 5 :::
 newtype Identifier
   = Identifier String
   deriving (Eq, Data, Ord)
-  deriving (Show) via String
+
+instance Show Identifier where show (Identifier s) = s
 
 instance IsString Identifier where
   fromString = Identifier
@@ -165,60 +167,75 @@ findExtremal edges = Set.fromList . filter (noInEdges edges) . map fst $ edges
 --- Monotone Framework ---
 
 data MonotoneFramework a = MF
-  { extremal :: Flow -> Set Label
-  , ι :: CFG -> Set a
-  , (⊥) :: CFG -> Set a
-  , transfer :: CFG -> Set a -> Label -> Set a
+  { ι :: Set a
+  , (⊥) :: Set a
   , (⊑) :: Set a -> Set a -> Bool
   , (⨆) :: Set a -> Set a -> Set a
-  , flow :: CFG -> Flow
+  , flow :: Flow
+  , extremal :: Flow -> Set Label
+  , transfer :: Set a -> Label -> Set a
   }
 
-worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
-worklist MF{..} cfg = result $ go (flow cfg) initialMap
-  where
-    initialMap = Map.fromList $ zip (Set.toList . extremal $ flow cfg) (repeat . ι $ cfg)
-    result = Map.mapWithKey (\l pre -> (pre, transfer cfg pre l))
-    go [] analysis = analysis
-    go ((l, l') : rest) analysis =
-      let analysisPre = Map.lookup l analysis ?: (⊥) cfg
-          analysisPost = Map.lookup l' analysis ?: (⊥) cfg
-          new = transfer cfg analysisPre l
-          newset = new ⨆ analysisPost
-          analysis' = Map.insert l' newset analysis
-          newEdges = filter ((== l') . fst) $ flow cfg
-       in if new ⊑ analysisPost
-            then go rest analysis
-            else go (newEdges ++ rest) analysis'
+type MFPResult a = IntMap (Set a, Set a)
 
-present :: Show a => IntMap (Set a, Set a) -> IO ()
+mfp :: (CFG -> MonotoneFramework a) -> CFG -> MFPResult a
+mfp getInstance cfg = result $ solve flow initialMap
+  where
+    MF{..} = getInstance cfg
+
+    -- Initialization
+    initialMap = Map.fromList $ zip (Set.toList $ extremal flow) (repeat ι)
+
+    -- Collecting the result
+    result = Map.mapWithKey (\l pre -> (pre, transfer pre l))
+
+    solve [] analysis = analysis
+    solve ((l, l') : rest) analysis =
+      let analysisPre = Map.lookup l analysis ?: (⊥)
+          analysisPost = Map.lookup l' analysis ?: (⊥)
+          new = transfer analysisPre l
+          jointAnalysis = new ⨆ analysisPost
+          analysis' = Map.insert l' jointAnalysis analysis
+          newEdges = filter ((== l') . fst) flow
+       in if new ⊑ analysisPost
+            then solve rest analysis
+            else solve (newEdges ++ rest) analysis'
+
+present :: Show a => MFPResult a -> IO ()
 present = traverse_ f . Map.toList
   where
     f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
 
 --- Reaching definitions ---
 
-type RDEntry = (Identifier, Maybe Label)
+data RDEntry = RDEntry {rdIdentifier :: Identifier, rdLabel :: Maybe Label} deriving (Ord, Eq)
 
 rdTransfer :: CFG -> Set RDEntry -> Label -> Set RDEntry
 rdTransfer cfg old l = gen <> (old Set.\\ kill)
   where
     block = Map.lookup l (_blocks cfg) ?: error ("Failed to find block at label " <> show l <> " in reaching definitions transfer function")
-    gen = Set.map (,Just l) $ defines block
-    kill = Set.filter ((`Set.member` killSet) . fst) old
+    gen = Set.map (`RDEntry` Just l) $ defines block
+    kill = Set.filter ((`Set.member` killSet) . rdIdentifier) old
     killSet = defines block
 
-rd :: MonotoneFramework RDEntry
-rd =
+rd :: CFG -> MonotoneFramework RDEntry
+rd cfg =
   MF
     { extremal = const (Set.singleton 0)
-    , ι = Set.map (,Nothing) . allIdentifiers
-    , (⊥) = const Set.empty
+    , ι = Set.map (`RDEntry` Nothing) . allIdentifiers $ cfg
+    , (⊥) = Set.empty
     , (⊑) = Set.isSubsetOf
     , (⨆) = Set.union
-    , transfer = rdTransfer
-    , flow = getFlow
+    , transfer = rdTransfer cfg
+    , flow = getFlow cfg
     }
+
+instance Show RDEntry where
+  show (RDEntry identifier label) = "(" <> show identifier <> "," <> label' <> ")"
+    where
+      label' = case label of
+        Just l -> show l
+        Nothing -> "?"
 
 --- Available expressions ---
 
@@ -233,16 +250,16 @@ aeTransfer cfg old l = (old Set.\\ kill) <> gen
       where
         killSet = defines block
 
-ae :: MonotoneFramework AEEntry
-ae =
+ae :: CFG -> MonotoneFramework AEEntry
+ae cfg =
   MF
     { extremal = const (Set.singleton 0)
-    , ι = const Set.empty
-    , (⊥) = foldMap allBinaryArithmetic . _blocks
+    , ι = Set.empty
+    , (⊥) = allBinaryArithmetic cfg
     , (⊑) = flip Set.isSubsetOf
     , (⨆) = Set.intersection
-    , transfer = aeTransfer
-    , flow = getFlow
+    , transfer = aeTransfer cfg
+    , flow = getFlow cfg
     }
 
 -- Very busy expressions
@@ -252,16 +269,16 @@ type VBEntry = AExp
 vbTransfer :: CFG -> Set VBEntry -> Label -> Set VBEntry
 vbTransfer = aeTransfer
 
-vb :: MonotoneFramework AEEntry
-vb =
+vb :: CFG -> MonotoneFramework AEEntry
+vb cfg =
   MF
     { extremal = findExtremal
-    , ι = const Set.empty
-    , (⊥) = foldMap allBinaryArithmetic . _blocks
+    , ι = Set.empty
+    , (⊥) = allBinaryArithmetic cfg
     , (⊑) = flip Set.isSubsetOf
     , (⨆) = Set.intersection
-    , transfer = vbTransfer
-    , flow = fmap swap . getFlow
+    , transfer = vbTransfer cfg
+    , flow = swap <$> getFlow cfg
     }
 
 --- Main ---
@@ -283,9 +300,12 @@ factorialCFG = controlFlowGraph factorial
 
 main :: IO ()
 main = do
-  present $ worklist ae factorialCFG
-  present $ worklist rd factorialCFG
-  present $ worklist vb factorialCFG
+  putStrLn "--- Reaching Definitions ---\n"
+  present $ mfp rd factorialCFG
+  putStrLn "\n--- Available Expressions ---\n"
+  present $ mfp ae factorialCFG
+  putStrLn "\n--- Very Bussy Expressions ---\n"
+  present $ mfp vb factorialCFG
 
 -- ⊥
 -- UP TACK
