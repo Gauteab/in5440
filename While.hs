@@ -14,6 +14,7 @@
 import Control.Lens
 import Data.Data (Data)
 import Data.Data.Lens (biplate)
+import Data.Foldable
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
 import Relude
@@ -24,7 +25,7 @@ import qualified Text.Show
 type Program = S
 
 data S
-  = Assignment Assignment
+  = AssignmentStatement Assignment
   | S ::: S -- Sequence Statements
   | Skip
   | If BExp S S
@@ -38,9 +39,6 @@ newtype Identifier
   deriving (Eq, Data, Ord)
 
 instance Show Identifier where show (Identifier s) = s
-
-instance IsString Identifier where
-  fromString = Identifier
 
 data Assignment
   = Identifier := AExp
@@ -119,7 +117,7 @@ controlFlowGraph = flip evalState 0 . f
         label2 <- get
         g2 <- f s2
         pure $ g1 <> g2 <> makeGraph label1 [] [label2]
-      Assignment a -> do
+      AssignmentStatement a -> do
         label <- freshLabel
         pure $ makeGraph label [AssignmentBlock a] []
       While condition body -> do
@@ -231,11 +229,7 @@ rd cfg =
     }
 
 instance Show RDEntry where
-  show (RDEntry identifier label) = "(" <> show identifier <> "," <> label' <> ")"
-    where
-      label' = case label of
-        Just l -> show l
-        Nothing -> "?"
+  show (RDEntry identifier label) = "(" <> show identifier <> "," <> maybe "?" show label <> ")"
 
 --- Available expressions ---
 
@@ -281,19 +275,57 @@ vb cfg =
     , flow = swap <$> getFlow cfg
     }
 
+--- DSL ---
+
+infixl 7 *.
+infixl 4 -., +.
+infix 4 >., <., ==.
+(*.) x y = BinaryArithmetic "*" (toAExp x) (toAExp y)
+(-.) x y = BinaryArithmetic "-" (toAExp x) (toAExp y)
+(+.) x y = BinaryArithmetic "+" (toAExp x) (toAExp y)
+(>.) x y = BinaryRelational ">" (toAExp x) (toAExp y)
+(<.) = BinaryRelational "<" (toAExp x) (toAExp y)
+(==.) = BinaryRelational "=="
+
+infix 3 =.
+(=.) :: ToAExp a => Identifier -> a -> S
+i =. x = AssignmentStatement $ i := toAExp x
+
+while :: ToStatement t => BExp -> t -> S
+while c = While c . toStatement
+
+class ToAExp a where toAExp :: a -> AExp
+instance ToAExp AExp where toAExp = id
+instance ToAExp Identifier where toAExp = Variable
+
+class ToStatement t where toStatement :: t -> S
+instance ToStatement S where toStatement = id
+instance ToStatement Assignment where toStatement = AssignmentStatement
+instance ToStatement a => ToStatement [a] where
+  toStatement [] = Skip
+  toStatement xs = foldr1 (:::) $ map toStatement xs
+
+instance IsString Identifier where fromString = Identifier
+x, y, z :: Identifier
+x = "x"
+y = "y"
+z = "z"
+
 --- Main ---
 
 -- [y:=x]0; [z:=1]1; while [y>1]2 do ([z:=z*y]3; [y:=y-1]4); [y:=0]5
 factorial :: Program
 factorial =
-  Assignment ("y" := Variable "x")
-    ::: Assignment ("z" := Number 1)
-    ::: While
-      (BinaryRelational ">" (Variable "y") (Number 1))
-      ( Assignment ("z" := BinaryArithmetic "*" (Variable "z") (Variable "y"))
-          ::: Assignment ("y" := BinaryArithmetic "-" (Variable "y") (Number 1))
-      )
-    ::: Assignment ("y" := Number 0)
+  toStatement
+    [ y =. x
+    , z =. Number 1
+    , while
+        (y >. Number 1)
+        [ z =. z *. y
+        , y =. y -. Number 1
+        ]
+    , y =. Number 0
+    ]
 
 factorialCFG :: CFG
 factorialCFG = controlFlowGraph factorial
