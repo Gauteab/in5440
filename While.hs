@@ -1,4 +1,5 @@
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DerivingVia #-}
@@ -9,18 +10,17 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
+import GHC.Exts
 import Control.Lens
 import Data.Data (Data)
 import Data.Data.Lens (biplate)
+import Data.Foldable ( Foldable(foldr1), all, traverse_ )
 import qualified Data.IntMap.Strict as Map
 import qualified Data.Set as Set
-
--- import Data.Text (Text)
 import Relude
-
--- import Text.Pretty.Simple (pPrint)
 import qualified Text.Show
 
 --- AST ---
@@ -28,7 +28,7 @@ import qualified Text.Show
 type Program = S
 
 data S
-  = Assignment Assignment
+  = AssignmentStatement Assignment
   | S ::: S -- Sequence Statements
   | Skip
   | If BExp S S
@@ -40,10 +40,8 @@ infixr 5 :::
 newtype Identifier
   = Identifier String
   deriving (Eq, Data, Ord)
-  deriving (Show) via String
 
-instance IsString Identifier where
-  fromString = Identifier
+instance Show Identifier where show (Identifier s) = s
 
 data Assignment
   = Identifier := AExp
@@ -80,31 +78,18 @@ makePrisms ''AExp
 
 --- Analysis ---
 
-type LabelMap a = IntMap (Set a)
-
 data CFG = CFG
   { _blocks :: IntMap Block
   , _edges :: IntMap [Label]
   }
   deriving (Show, Data)
 
-deriving instance Plated CFG
+data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
+  deriving (Show, Data)
 
 type Flow = [(Label, Label)]
 
-allEdges :: CFG -> Flow
-allEdges (CFG _ edg) =
-  [ (from, to)
-  | (from, vs) <- Map.toList edg
-  , to <- vs
-  ]
-
-makeGraph :: Label -> [Block] -> [Label] -> CFG
-makeGraph label blocks edges =
-  CFG
-    { _blocks = Map.fromList $ zip (repeat label) blocks
-    , _edges = Map.singleton label edges
-    }
+type Label = Int
 
 instance Semigroup CFG where
   (CFG blocks1 edges1) <> (CFG blocks2 edges2) =
@@ -113,13 +98,16 @@ instance Semigroup CFG where
 instance Monoid CFG where
   mempty = CFG mempty mempty
 
-type Label = Int
-
-data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
-  deriving (Show, Data)
-
+-- makeLenses ''CFG
 deriving instance Plated Block
-makePrisms ''Block
+deriving instance Plated CFG
+
+makeGraph :: Label -> [Block] -> [Label] -> CFG
+makeGraph label blocks edges =
+  CFG
+    { _blocks = Map.fromList $ zip (repeat label) blocks
+    , _edges = Map.singleton label edges
+    }
 
 controlFlowGraph :: Program -> CFG
 controlFlowGraph = flip evalState 0 . f
@@ -132,7 +120,7 @@ controlFlowGraph = flip evalState 0 . f
         label2 <- get
         g2 <- f s2
         pure $ g1 <> g2 <> makeGraph label1 [] [label2]
-      Assignment a -> do
+      AssignmentStatement a -> do
         label <- freshLabel
         pure $ makeGraph label [AssignmentBlock a] []
       While condition body -> do
@@ -144,61 +132,107 @@ controlFlowGraph = flip evalState 0 . f
         pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
-freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
+freshLabel = state $ id &&& (+ 1)
 
---- Worklist Algorithm ---
+getFlow :: CFG -> Flow
+getFlow cfg = do
+  (from, vs) <- Map.toList $ _edges cfg
+  to <- vs
+  pure (from, to)
 
-allAExp :: Block -> Set AExp
-allAExp = Set.fromList . toListOf (biplate . cosmos . filteredBy _BinaryArithmetic)
+--- Analysis ---
 
-identifiers :: Data a => a -> Set Identifier
-identifiers = toSetOf biplate
+allBinaryArithmetic :: Data a => a -> Set AExp
+allBinaryArithmetic = toSetOf $ biplate . cosmos . filteredBy _BinaryArithmetic
+
+allIdentifiers :: Data a => a -> Set Identifier
+allIdentifiers = toSetOf biplate
 
 toSetOf :: Ord a => Getting (Endo [a]) s a -> s -> Set a
 toSetOf l = Set.fromList . toListOf l
 
 uses :: Block -> Set Identifier
-uses (AssignmentBlock (_ := a)) = identifiers a
-uses a = identifiers a
+uses (AssignmentBlock (_ := a)) = allIdentifiers a
+uses a = allIdentifiers a
 
 defines :: Block -> Set Identifier
 defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
 
+findExtremal :: Flow -> Set Label
+findExtremal edges = Set.fromList . filter (noInEdges edges) . map fst $ edges
+  where
+    noInEdges :: Flow -> Label -> Bool
+    noInEdges edges l = all ((/= l) . snd) edges
+
+--- Monotone Framework ---
+
 data MonotoneFramework a = MF
-  { extremal :: Flow -> Set Label
-  , ι :: CFG -> Set a
-  , (⊥) :: CFG -> Set a
-  , transfer :: CFG -> Set a -> Label -> Set a
+  { ι :: Set a
+  , (⊥) :: Set a
   , (⊑) :: Set a -> Set a -> Bool
   , (⨆) :: Set a -> Set a -> Set a
-  , flow :: CFG -> Flow
+  , flow :: Flow
+  , extremal :: Flow -> Set Label
+  , transfer :: Set a -> Label -> Set a
   }
+
+type MFPResult a = IntMap (Set a, Set a)
+
+mfp :: (CFG -> MonotoneFramework a) -> CFG -> MFPResult a
+mfp getInstance cfg = result $ solve flow initialMap
+  where
+    MF{..} = getInstance cfg
+
+    -- Initialization
+    initialMap = Map.fromList $ zip (Set.toList $ extremal flow) (repeat ι)
+
+    -- Collecting the result
+    result = Map.mapWithKey (\l pre -> (pre, transfer pre l))
+
+    solve [] analysis = analysis
+    solve ((l, l') : rest) analysis =
+      let analysisPre = Map.lookup l analysis ?: (⊥)
+          analysisPost = Map.lookup l' analysis ?: (⊥)
+          new = transfer analysisPre l
+          jointAnalysis = new ⨆ analysisPost
+          analysis' = Map.insert l' jointAnalysis analysis
+          newEdges = filter ((== l') . fst) flow
+       in if new ⊑ analysisPost
+            then solve rest analysis
+            else solve (newEdges ++ rest) analysis'
+
+present :: Show a => MFPResult a -> IO ()
+present = traverse_ f . Map.toList
+  where
+    f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
 
 --- Reaching definitions ---
 
-type RDEntry = (Identifier, Maybe Label)
+data RDEntry = RDEntry {rdIdentifier :: Identifier, rdLabel :: Maybe Label} deriving (Ord, Eq)
 
 rdTransfer :: CFG -> Set RDEntry -> Label -> Set RDEntry
 rdTransfer cfg old l = gen <> (old Set.\\ kill)
   where
-    Just block = Map.lookup l $ _blocks cfg
-    gen = Set.map (,Just l) $ defines block
-    kill = Set.filter ((`Set.member` killSet) . fst) old
-      where
-        killSet = defines block
+    block = Map.lookup l (_blocks cfg) ?: error ("Failed to find block at label " <> show l <> " in reaching definitions transfer function")
+    gen = Set.map (`RDEntry` Just l) $ defines block
+    kill = Set.filter ((`Set.member` killSet) . rdIdentifier) old
+    killSet = defines block
 
-rd :: MonotoneFramework RDEntry
-rd =
+rd :: CFG -> MonotoneFramework RDEntry
+rd cfg =
   MF
     { extremal = const (Set.singleton 0)
-    , ι = Set.map (,Nothing) . identifiers
-    , (⊥) = const Set.empty
+    , ι = Set.map (`RDEntry` Nothing) . allIdentifiers $ cfg
+    , (⊥) = Set.empty
     , (⊑) = Set.isSubsetOf
     , (⨆) = Set.union
-    , transfer = rdTransfer
-    , flow = allEdges
+    , transfer = rdTransfer cfg
+    , flow = getFlow cfg
     }
+
+instance Show RDEntry where
+  show (RDEntry identifier label) = "(" <> show identifier <> "," <> maybe "?" show label <> ")"
 
 --- Available expressions ---
 
@@ -208,10 +242,108 @@ aeTransfer :: CFG -> Set AEEntry -> Label -> Set AEEntry
 aeTransfer cfg old l = (old Set.\\ kill) <> gen
   where
     Just block = Map.lookup l $ _blocks cfg
-    gen = allAExp block
-    kill = Set.filter (not . (`Set.disjoint` killSet) . toSetOf biplate) old
+    gen = allBinaryArithmetic block
+    kill = Set.filter (not . (`Set.disjoint` killSet) . allIdentifiers) old
       where
         killSet = defines block
+
+ae :: CFG -> MonotoneFramework AEEntry
+ae cfg =
+  MF
+    { extremal = const (Set.singleton 0)
+    , ι = Set.empty
+    , (⊥) = allBinaryArithmetic cfg
+    , (⊑) = flip Set.isSubsetOf
+    , (⨆) = Set.intersection
+    , transfer = aeTransfer cfg
+    , flow = getFlow cfg
+    }
+
+-- Very busy expressions
+
+type VBEntry = AExp
+
+vbTransfer :: CFG -> Set VBEntry -> Label -> Set VBEntry
+vbTransfer = aeTransfer
+
+vb :: CFG -> MonotoneFramework AEEntry
+vb cfg =
+  MF
+    { extremal = findExtremal
+    , ι = Set.empty
+    , (⊥) = allBinaryArithmetic cfg
+    , (⊑) = flip Set.isSubsetOf
+    , (⨆) = Set.intersection
+    , transfer = vbTransfer cfg
+    , flow = swap <$> getFlow cfg
+    }
+
+--- DSL ---
+
+infixl 7 *.
+infixl 4 -., +.
+infix 4 >., <., ==.
+(*.) x y = BinaryArithmetic "*" (toAExp x) (toAExp y)
+(-.) x y = BinaryArithmetic "-" (toAExp x) (toAExp y)
+(+.) x y = BinaryArithmetic "+" (toAExp x) (toAExp y)
+(>.) x y = BinaryRelational ">" (toAExp x) (toAExp y)
+(<.) = BinaryRelational "<" (toAExp x) (toAExp y)
+(==.) = BinaryRelational "=="
+
+infix 3 =.
+(=.) :: ToAExp a => Identifier -> a -> S
+i =. x = AssignmentStatement $ i := toAExp x
+
+
+class ToAExp a where toAExp :: a -> AExp
+instance ToAExp Identifier where toAExp = Variable
+instance ToAExp AExp where toAExp = id
+
+class ToStatement t where toStatement :: t -> S
+instance ToStatement S where toStatement = id
+instance ToStatement Assignment where toStatement = AssignmentStatement
+instance ToStatement a => ToStatement [a] where
+  toStatement [] = Skip
+  toStatement xs = foldr1 (:::) $ map toStatement xs
+
+instance IsString Identifier where fromString = Identifier
+x, y, z :: Identifier
+x = "x"
+y = "y"
+z = "z"
+
+instance IsList S where
+  type Item S = S
+  fromList [] = Skip
+  fromList xs = foldr1 (:::) xs
+  toList = undefined
+
+--- Main ---
+
+-- [y:=x]0; [z:=1]1; while [y>1]2 do ([z:=z*y]3; [y:=y-1]4); [y:=0]5
+factorial :: Program
+factorial =
+    [ y =. x
+    , z =. Number 1
+    , While
+        (y >. Number 1)
+        [ z =. z *. y
+        , y =. y -. Number 1
+        ]
+    , y =. Number 0
+    ]
+
+factorialCFG :: CFG
+factorialCFG = controlFlowGraph factorial
+
+main :: IO ()
+main = do
+  putStrLn "--- Reaching Definitions ---\n"
+  present $ mfp rd factorialCFG
+  putStrLn "\n--- Available Expressions ---\n"
+  present $ mfp ae factorialCFG
+  putStrLn "\n--- Very Busy Expressions ---\n"
+  present $ mfp vb factorialCFG
 
 -- ⊥
 -- UP TACK
@@ -227,113 +359,3 @@ aeTransfer cfg old l = (old Set.\\ kill) <> gen
 -- ι
 -- GREEK SMALL LETTER IOTA
 -- Unicode: U+03B9, UTF-8: CE B9
-
-ae :: MonotoneFramework AEEntry
-ae =
-  MF
-    { extremal = const (Set.singleton 0)
-    , ι = const Set.empty
-    , (⊥) = foldMap allAExp . _blocks
-    , (⊑) = flip Set.isSubsetOf
-    , (⨆) = Set.intersection
-    , transfer = aeTransfer
-    , flow = allEdges
-    }
-
--- Very busy expressions
-
-type VBEntry = AExp
-
-vbTransfer :: CFG -> Set VBEntry -> Label -> Set VBEntry
-vbTransfer = aeTransfer
-
-findExtremal :: Flow -> Set Label
-findExtremal edges = Set.fromList . filter (noInEdges edges) . map fst $ edges
-  where
-    noInEdges :: Flow -> Label -> Bool
-    noInEdges edges l = all ((/= l) . snd) edges
-
-vb :: MonotoneFramework AEEntry
-vb =
-  MF
-    { extremal = findExtremal
-    , ι = const Set.empty
-    , (⊥) = foldMap allAExp . _blocks
-    , (⊑) = flip Set.isSubsetOf
-    , (⨆) = Set.intersection
-    , transfer = vbTransfer
-    , flow = fmap swap . allEdges
-    }
-
--- worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap (a, a)
-worklist :: MonotoneFramework a -> CFG -> IntMap (Set a, Set a)
-worklist MF{..} cfg = result $ go (flow cfg) initialMap
-  where
-    initialMap = Map.fromList $ zip (Set.toList . extremal $ flow cfg) (repeat . ι $ cfg)
-    result = Map.mapWithKey (\l pre -> (pre, transfer cfg pre l))
-    go [] !output = output
-    go ((l, l') : rest) !output =
-      let analysisPre = Map.lookup l output ?: (⊥) cfg
-          analysisPost = Map.lookup l' output ?: (⊥) cfg
-          new = transfer cfg analysisPre l
-          newset = new ⨆ analysisPost
-          output' = Map.insert l' newset output
-          edges = filter ((== l') . fst) $ flow cfg
-       in if new ⊑ analysisPost
-            then go rest output
-            else go (edges ++ rest) output'
-
-present :: Show a => IntMap (Set a, Set a) -> IO ()
-present = traverse_ f . Map.toList
-  where
-    f (l, (a, b)) = putStrLn $ show l ++ ": " ++ show (Set.toList a) ++ " " ++ show (Set.toList b)
-
---- Main ---
-
---[y:=x]0; [z:=1]1; while [y>1]2 do ([z:=z*y]3; [y:=y-1]4); [y:=0]5
-factorial :: Program
-factorial =
-  Assignment ("y" := Variable "x")
-    ::: Assignment ("z" := Number 1)
-    ::: While
-      (BinaryRelational ">" (Variable "y") (Number 1))
-      ( Assignment ("z" := BinaryArithmetic "*" (Variable "z") (Variable "y"))
-          ::: Assignment ("y" := BinaryArithmetic "-" (Variable "y") (Number 1))
-      )
-    ::: Assignment ("y" := Number 0)
-
-cfg :: CFG
-cfg = controlFlowGraph factorial
-
-block :: Block
-block = AssignmentBlock ("z" := BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y"))
-
-aexp :: AExp
-aexp = BinaryArithmetic "*" (BinaryArithmetic "+" (BinaryArithmetic "-" (Number 3) (Number 1)) (Number 1)) (Variable "y")
-
-bexp :: BExp
-bexp = BinaryRelational ">" (Variable "y") (BinaryArithmetic "+" (Number 3) (Number 1))
-
-main :: IO ()
-main = do
-  let cfg = controlFlowGraph factorial
-  -- present $ worklist ae cfg
-  -- present $ worklist rd cfg
-  present $ worklist vb cfg
-
--- spec :: Spec
--- spec = do
---   let factorialCFG =
---         Map.fromList
---           [ (1, (AssignmentBlock , Edge 2))
---           , (2, (AssignmentBlock, Edge 3))
---           , (3, (AssignmentBlock, Branch 4 6))
---           , (4, (AssignmentBlock, Edge 5))
---           , (5, (AssignmentBlock, Edge 3))
---           ]
---   describe "control flow graph" $ do
---     it "can retrieve edges" $ do
---       edges 2 factorialCFG `shouldBe` [3, 5]
---       edges 5 factorialCFG `shouldBe` []
---     it "can be constructed from factorial program" $ do
---       controlFlowGraph factorial `shouldBe` factorialCFG
